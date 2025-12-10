@@ -1,0 +1,41 @@
+name: SAST - Semgrep 
+
+on:
+  workflow_dispatch:
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Run Semgrep SAST on canonicalization-example
+        working-directory: canonicalization-example
+        run: |
+          semgrep \
+            --config p/owasp-top-ten \
+            --error \
+            --sarif --output semgrep-results.sarif
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: canonicalization-example/semgrep-results.sarif
+          category: canonicalization-semgrep
