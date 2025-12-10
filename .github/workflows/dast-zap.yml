@@ -1,10 +1,7 @@
-name: DAST - OWASP ZAP Full Scan
+name: DAST - OWASP ZAP Full Scan (IDOR)
 
 on:
- workflow_dispatch:  #run manually from Actions tab
- # You can also add:
- # push:
- #   branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   zap_scan:
@@ -19,21 +16,19 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install lab dependencies
-        working-directory: fastbank_insecure_classwork/backend
-        run: |
-          npm install
+      - name: Install IDOR dependencies
+        working-directory: idor
+        run: npm install
 
-      - name: Start vulnerable app
-        working-directory: fastbank_insecure_classwork/backend
+      - name: Start IDOR app
+        working-directory: idor
         run: |
           npm start &
-          # wait for the server to boot
           sleep 20
 
       - name: Run OWASP ZAP full scan
         uses: zaproxy/action-full-scan@v0.13.0
         with:
-          target: 'Server running at http://localhost:3000'
-          fail_action: true  # fail job if ZAP finds alerts
-          allow_issue_writing: false  # don't auto-open Github issues
+          target: 'http://localhost:3000'
+          fail_action: true
+          allow_issue_writing: false
