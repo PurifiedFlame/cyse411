@@ -1,132 +1,199 @@
+const path = require("path");
 const express = require("express");
-const bodyParser = require("body-parser");
 const cookieParser = require("cookie-parser");
 const crypto = require("crypto");
-const bcrypt = require("bcrypt"); // Now actively used for security
+const bcrypt = require("bcrypt");
 
 const app = express();
 const PORT = 3001;
 
-// --- SECURITY MIDDLEWARE ---
+
+const COOKIE_NAME = "session";
+const SESSION_LIFETIME_MS = 60 * 60 * 1000; // 1 hour
+const BCRYPT_ROUNDS = 10;
+
+// Demo credentials (lab only)
+const DEMO = Object.freeze({
+  id: 1,
+  username: "student",
+  password: "password123",
+});
+
+
+function securityHeaders() {
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self' data:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join("; ");
+
+  return function (req, res, next) {
+    res.removeHeader("x-powered-by");
+
+    res.set("Content-Security-Policy", csp);
+    res.set(
+      "Permissions-Policy",
+      "camera=(), microphone=(), geolocation=(), fullscreen=(self)"
+    );
+
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+
+    res.set("X-Content-Type-Options", "nosniff");
+    next();
+  };
+}
+
+function setAuthCookie(res, token) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: false, 
+    sameSite: "strict",
+    maxAge: SESSION_LIFETIME_MS,
+  });
+}
+
+function clearAuthCookie(res) {
+  res.clearCookie(COOKIE_NAME);
+}
+
+function genericLoginError(res) {
+  return res.status(401).json({
+    success: false,
+    message: "Invalid username or password",
+  });
+}
+
+
+function buildUserStore() {
+  const passwordHash = bcrypt.hashSync(DEMO.password, BCRYPT_ROUNDS);
+  
+  const usersByName = new Map();
+  usersByName.set(DEMO.username, {
+    id: DEMO.id,
+    username: DEMO.username,
+    passwordHash,
+  });
+
+  return {
+    findByUsername: (uname) => usersByName.get(uname) || null,
+    findById: (id) => {
+      for (const u of usersByName.values()) {
+        if (u.id === id) return u;
+      }
+      return null;
+    },
+  };
+}
+
+const users = buildUserStore();
+
+// Session store (in-memory)
+function createSessionManager() {
+  const store = Object.create(null);
+
+  function mint() {
+    return crypto.randomUUID();
+  }
+
+  function create(uid) {
+    const token = mint();
+    store[token] = { uid, exp: Date.now() + SESSION_LIFETIME_MS };
+    return token;
+  }
+
+  function read(token) {
+    if (!token) return null;
+    const entry = store[token];
+    if (!entry) return null;
+
+    if (Date.now() > entry.exp) {
+      delete store[token];
+      return null;
+    }
+    return entry;
+  }
+
+  function destroy(token) {
+    if (!token) return;
+    delete store[token];
+  }
+
+  return { create, read, destroy };
+}
+
+const sessions = createSessionManager();
+
+// Middleware
 app.disable("x-powered-by");
 
+app.use(securityHeaders());
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+app.use(cookieParser());
+
+app.use(express.static(path.join(__dirname, "public")));
+
 app.use((req, res, next) => {
-  // 2. Content Security Policy (CSP)
-  res.set(
-    "Content-Security-Policy",
-    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
-  );
+  const token = req.cookies[COOKIE_NAME];
+  const session = sessions.read(token);
 
-  // 3. Permissions Policy (Fixes ZAP: "Permissions Policy Header Not Set")
-  // Restricts access to powerful browser features like camera/mic
-  res.set(
-    "Permissions-Policy",
-    "camera=(), microphone=(), geolocation=(), fullscreen=(self)"
-  );
-
-  // 4. Cache Control (Fixes ZAP: "Storable and Cacheable Content")
-  // Ensures sensitive API responses are not cached by the browser
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-
-  // 5. Anti-MIME Sniffing
-  res.set("X-Content-Type-Options", "nosniff");
+  req.auth = {
+    token: token || null,
+    session: session || null,
+    clearCookie: () => clearAuthCookie(res),
+  };
 
   next();
 });
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-app.use(cookieParser());
-app.use(express.static("public"));
-
-// --- SECURE USER DATABASE ---
-// We generate a valid bcrypt hash for the demo user at startup.
-const SALT_ROUNDS = 10;
-const demoPassword = "password123";
-const demoHash = bcrypt.hashSync(demoPassword, SALT_ROUNDS);
-
-const users = [
-  {
-    id: 1,
-    username: "student",
-    passwordHash: demoHash // Securely hashed
-  }
-];
-
-// In-memory session store
-const sessions = {}; 
-
-// Home API
+// Routes
 app.get("/api/me", (req, res) => {
-  const token = req.cookies.session;
-  if (!token || !sessions[token]) {
-    return res.status(401).json({ authenticated: false });
-  }
-  
-  // Verify session expiration (Optional safety check)
-  const session = sessions[token];
-  if (Date.now() > session.expiresAt) {
-    delete sessions[token];
-    res.clearCookie("session");
+  if (!req.auth.session) {
+    req.auth.clearCookie();
     return res.status(401).json({ authenticated: false });
   }
 
-  const user = users.find((u) => u.id === session.userId);
-  // Return only safe user info
-  res.json({ authenticated: true, username: user.username });
-});
-
-// Secure Login Endpoint
-app.post("/api/login", async (req, res) => {
-  const { username, password } = req.body;
-  const user = users.find((u) => u.username === username);
-
-  // GENERIC ERROR HANDLING
-  const genericError = { success: false, message: "Invalid username or password" };
-
+  const user = users.findById(req.auth.session.uid);
   if (!user) {
-    return res.status(401).json(genericError);
+    // defensive cleanup
+    sessions.destroy(req.auth.token);
+    req.auth.clearCookie();
+    return res.status(401).json({ authenticated: false });
   }
 
-  const match = await bcrypt.compare(password, user.passwordHash);
-  if (!match) {
-    return res.status(401).json(genericError);
-  }
-
-  // SECURE SESSION GENERATION
-  // Use crypto.randomUUID for a high-entropy, unpredictable token
-  const token = crypto.randomUUID();
-
-  // Store session with expiration (e.g., 1 hour)
-  sessions[token] = { 
-    userId: user.id,
-    expiresAt: Date.now() + 3600000 // 1 hour from now
-  };
-
-  // SECURE COOKIE SETTINGS
-  res.cookie("session", token, {
-    httpOnly: true,  // Prevents JS access (Mitigates XSS)
-    secure: false,   // Set to TRUE in production (requires HTTPS)
-    sameSite: "strict", // Prevents CSRF
-    maxAge: 3600000  // 1 hour
-  });
-
-  res.json({ success: true, token }); // Sending token in body is optional if using cookies
+  return res.json({ authenticated: true, username: user.username });
 });
 
-// Logout
+app.post("/api/login", async (req, res) => {
+  const username = String((req.body && req.body.username) || "");
+  const password = String((req.body && req.body.password) || "");
+
+  const user = users.findByUsername(username);
+  if (!user) return genericLoginError(res);
+
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return genericLoginError(res);
+
+  const token = sessions.create(user.id);
+  setAuthCookie(res, token);
+
+  return res.json({ success: true, token });
+});
+
 app.post("/api/logout", (req, res) => {
-  const token = req.cookies.session;
-  if (token && sessions[token]) {
-    delete sessions[token];
-  }
-  res.clearCookie("session");
-  res.json({ success: true });
+  sessions.destroy(req.auth.token);
+  clearAuthCookie(res);
+  return res.json({ success: true });
 });
 
-// 404 Handler
+
 app.use((req, res) => {
   res.status(404).send("Not found");
 });
