@@ -1,4 +1,4 @@
-name: DAST scan (fastbank)
+name: DAST scan canonicalization
 
 on:
   workflow_dispatch:
@@ -17,12 +17,12 @@ jobs:
           node-version: '20'
 
       - name: Install lab dependencies
-        working-directory: fastbank-auth-lab
+        working-directory: canonicalization-example
         run: |
           npm install
 
       - name: Start vulnerable app
-        working-directory: fastbank-auth-lab
+        working-directory: canonicalization-example
         run: |
           npm start &
           # wait for the server to boot
