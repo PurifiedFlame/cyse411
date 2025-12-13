@@ -1,84 +1,143 @@
-// server.js
-const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const { body, validationResult } = require('express-validator');
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const { body, validationResult } = require("express-validator");
 
 const app = express();
+
+// setup / config
+const FILES_DIR = path.join(__dirname, "files"); // readable + common pattern
+fs.mkdirSync(FILES_DIR, { recursive: true });
+
+// middleware
+app.disable("x-powered-by");
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, "public")));
 
-const BASE_DIR = path.resolve(__dirname, 'files');
-if (!fs.existsSync(BASE_DIR)) fs.mkdirSync(BASE_DIR, { recursive: true });
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+  );
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), fullscreen=(self)");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  next();
+});
 
-// helper to canonicalize and check
-function resolveSafe(baseDir, userInput) {
+// helpers
+function tryDecode(value) {
   try {
-    userInput = decodeURIComponent(userInput);
-  } catch (e) {}
-  return path.resolve(baseDir, userInput);
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
-// Secure route
-app.post(
-  '/read',
-  body('filename')
-    .exists().withMessage('filename required')
+function toSafePath(rootDir, userPath) {
+  const raw = String(userPath ?? "");
+  const decoded = tryDecode(raw);
+
+  const absRoot = path.resolve(rootDir);
+  const absTarget = path.resolve(absRoot, decoded);
+
+  const insideRoot =
+    absTarget === absRoot || absTarget.startsWith(absRoot + path.sep);
+
+  return insideRoot ? absTarget : null;
+}
+
+function mapReadError(err, res) {
+  if (!err || !err.code) return res.status(500).json({ error: "Internal Server Error" });
+  if (err.code === "ENOENT") return res.status(404).json({ error: "File not found" });
+  if (err.code === "EISDIR") return res.status(400).json({ error: "Cannot read a directory" });
+  console.error(err);
+  return res.status(500).json({ error: "Internal Server Error" });
+}
+
+// routes
+const readValidators = [
+  body("filename")
+    .exists().withMessage("filename required")
     .bail()
-    .isString()
+    .isString().withMessage("filename must be a string")
+    .bail()
     .trim()
-    .notEmpty().withMessage('filename must not be empty')
-    .custom(value => {
-      if (value.includes('\0')) throw new Error('null byte not allowed');
+    .notEmpty().withMessage("filename must not be empty")
+    .bail()
+    .custom((v) => {
+      if (String(v).includes("\0")) throw new Error("null byte not allowed");
       return true;
     }),
-  (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+];
 
-    const filename = req.body.filename;
-    const normalized = resolveSafe(BASE_DIR, filename);
-    if (!normalized.startsWith(BASE_DIR + path.sep)) {
-      return res.status(403).json({ error: 'Path traversal detected' });
-    }
-    if (!fs.existsSync(normalized)) return res.status(404).json({ error: 'File not found' });
+app.post("/read", readValidators, (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-    const content = fs.readFileSync(normalized, 'utf8');
-    res.json({ path: normalized, content });
+  const requested = req.body.filename;
+  const safeAbs = toSafePath(FILES_DIR, requested);
+
+  if (!safeAbs) {
+    return res.status(403).json({ error: "Path traversal detected" });
   }
-);
 
-// Vulnerable route (demo)
-app.post('/read-no-validate', (req, res) => {
-  const filename = req.body.filename || '';
-  const joined = path.join(BASE_DIR, filename); // intentionally vulnerable
-  if (!fs.existsSync(joined)) return res.status(404).json({ error: 'File not found', path: joined });
-  const content = fs.readFileSync(joined, 'utf8');
-  res.json({ path: joined, content });
+  try {
+    const content = fs.readFileSync(safeAbs, "utf8");
+    return res.json({ path: safeAbs, content });
+  } catch (err) {
+    return mapReadError(err, res);
+  }
 });
 
-// Helper route for samples
-app.post('/setup-sample', (req, res) => {
+app.post("/read-no-validate", (req, res) => {
+  const filename = (req.body && req.body.filename) || "";
+  const target = path.join(FILES_DIR, filename);
+
+  if (!fs.existsSync(target)) {
+    return res.status(404).json({ error: "File not found", path: target });
+  }
+
+  try {
+    const content = fs.readFileSync(target, "utf8");
+    return res.json({ path: target, content });
+  } catch {
+    return res.status(500).json({ error: "Read error" });
+  }
+});
+
+app.post("/setup-sample", (req, res) => {
   const samples = {
-    'hello.txt': 'Hello from safe file!\n',
-    'notes/readme.md': '# Readme\nSample readme file'
+    "hello.txt": "Hello from safe file!\n",
+    "notes/readme.md": "# Readme\nSample readme file",
   };
-  Object.keys(samples).forEach(k => {
-    const p = path.resolve(BASE_DIR, k);
-    const d = path.dirname(p);
-    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-    fs.writeFileSync(p, samples[k], 'utf8');
-  });
-  res.json({ ok: true, base: BASE_DIR });
+
+  try {
+    for (const rel of Object.keys(samples)) {
+      const out = toSafePath(FILES_DIR, rel);
+      if (!out) continue;
+
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, samples[rel], "utf8");
+    }
+    return res.json({ ok: true, base: FILES_DIR });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Setup failed" });
+  }
 });
 
-// Only listen when run directly (not when imported by tests)
+// fallback
+app.use((req, res) => res.status(404).send("Not found"));
+
+// start
 if (require.main === module) {
-  const port = process.env.PORT || 4000;
-  app.listen(port, () => {
-    console.log(`Server listening on http://localhost:${port}`);
-  });
+  const PORT = process.env.PORT || 4000;
+  app.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
 }
 
 module.exports = app;
