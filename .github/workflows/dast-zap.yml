@@ -1,4 +1,4 @@
-name: DAST scan canonicalization
+name: DAST scan idor
 
 on:
   workflow_dispatch:
